@@ -6,7 +6,14 @@ import cors from "cors";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    "https://ahmadiezat11246.github.io", // allow your GitHub Pages
+    "http://localhost:3000"              // allow local testing too
+  ],
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type"]
+}));
 app.use(bodyParser.json());
 
 // POST endpoint for machine logs
