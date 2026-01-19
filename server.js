@@ -29,7 +29,13 @@ function buildCanonicalString(body) {
     "MachineName=" + enc(body.MachineName) +
     "&MachineID=" + enc(body.MachineID) +
     "&ErrorCode=" + enc(body.ErrorCode) +
-    "&ErrorText=" + enc(body.ErrorText)
+    "&ErrorText=" + enc(body.ErrorText) +
+    "&iat=" + enc(p.iat) +
+    "&exp=" + enc(p.exp) +
+    "&nonce=" + enc(p.nonce) +
+    "&scope=" + enc(p.scope) +
+    "&deviceId=" + enc(p.deviceId) +
+    "&kid=" + enc(p.kid)
   );
 }
 
@@ -50,6 +56,87 @@ function safeCompareHex(a, b) {
 
   return crypto.timingSafeEqual(bufA, bufB);
 }
+function nowUnix() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function randomNonceHex(bytes = 16) {
+  return crypto.randomBytes(bytes).toString("hex"); // 32 hex chars if bytes=16
+}
+app.post("/issue-link", (req, res) => {
+  try {
+    if (!HMAC_SECRET_KEY) {
+      return res.status(500).json({ message: "Server misconfigured: missing HMAC_SECRET_KEY" });
+    }
+
+    // Read input (from HMI)
+    const body = req.body || {};
+
+    // Basic required fields (minimal validation)
+    const MachineName = body.MachineName ?? "";
+    const MachineID   = body.MachineID ?? "";
+    const ErrorCode   = body.ErrorCode ?? "";
+    const ErrorText   = body.ErrorText ?? "";
+
+    // You can pass these from HMI; for now allow defaults
+    const deviceId = body.deviceId ?? "HMI-UNKNOWN";
+    const scope    = body.scope ?? "submit"; // or "read"
+    const kid      = String(body.kid ?? "1");
+
+    // Time window (60 seconds example)
+    const iat = nowUnix();
+    const exp = iat + 60;
+
+    // Nonce for replay protection later
+    const nonce = randomNonceHex(16);
+
+    // Build payload to sign
+    const payload = {
+      MachineName,
+      MachineID,
+      ErrorCode,
+      ErrorText,
+      iat: String(iat),
+      exp: String(exp),
+      nonce,
+      scope,
+      deviceId,
+      kid
+    };
+
+    // Sign
+    const canonical = buildCanonicalStringV2(payload);
+    const sig = hmacSha256Hex(HMAC_SECRET_KEY, canonical);
+
+    // Build signed URL
+    const baseUrl =
+      process.env.FRONTEND_BASE_URL ||
+      "https://ahmadiezat11246.github.io/QR/ContactPage.html";
+
+    const signedUrl =
+      baseUrl +
+      "?MachineName=" + enc(MachineName) +
+      "&MachineID=" + enc(MachineID) +
+      "&ErrorCode=" + enc(ErrorCode) +
+      "&ErrorText=" + enc(ErrorText) +
+      "&iat=" + enc(iat) +
+      "&exp=" + enc(exp) +
+      "&nonce=" + enc(nonce) +
+      "&scope=" + enc(scope) +
+      "&deviceId=" + enc(deviceId) +
+      "&kid=" + enc(kid) +
+      "&sig=" + enc(sig);
+
+    return res.status(200).json({
+      ok: true,
+      signedUrl,
+      payload // useful for debugging; you can remove later
+    });
+
+  } catch (err) {
+    return res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 
 app.post("/log", (req, res) => {
   try {
