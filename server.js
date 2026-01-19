@@ -18,18 +18,24 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "X-BMS-Signature"]
 }));
 
-app.use(bodyParser.json());
+// Optional but recommended: limit body size to avoid abuse/log flooding
+app.use(bodyParser.json({ limit: "50kb" }));
 
 function enc(v) {
   return encodeURIComponent(v ?? "");
 }
 
-function buildCanonicalString(body) {
+/**
+ * V2 canonical string MUST match the HMI exactly:
+ * MachineName, MachineID, ErrorCode, ErrorText, iat, exp, nonce, scope, deviceId, kid
+ * (same order, URL-encoding)
+ */
+function buildCanonicalStringV2(p) {
   return (
-    "MachineName=" + enc(body.MachineName) +
-    "&MachineID=" + enc(body.MachineID) +
-    "&ErrorCode=" + enc(body.ErrorCode) +
-    "&ErrorText=" + enc(body.ErrorText) +
+    "MachineName=" + enc(p.MachineName) +
+    "&MachineID=" + enc(p.MachineID) +
+    "&ErrorCode=" + enc(p.ErrorCode) +
+    "&ErrorText=" + enc(p.ErrorText) +
     "&iat=" + enc(p.iat) +
     "&exp=" + enc(p.exp) +
     "&nonce=" + enc(p.nonce) +
@@ -56,41 +62,40 @@ function safeCompareHex(a, b) {
 
   return crypto.timingSafeEqual(bufA, bufB);
 }
+
 function nowUnix() {
   return Math.floor(Date.now() / 1000);
 }
 
 function randomNonceHex(bytes = 16) {
-  return crypto.randomBytes(bytes).toString("hex"); // 32 hex chars if bytes=16
+  return crypto.randomBytes(bytes).toString("hex");
 }
+
+/**
+ * Server-side issuing endpoint (optional in your offline-HMI scenario).
+ * You can keep it for testing/demo, but your real flow is HMI-side signing.
+ */
 app.post("/issue-link", (req, res) => {
   try {
     if (!HMAC_SECRET_KEY) {
       return res.status(500).json({ message: "Server misconfigured: missing HMAC_SECRET_KEY" });
     }
 
-    // Read input (from HMI)
     const body = req.body || {};
 
-    // Basic required fields (minimal validation)
     const MachineName = body.MachineName ?? "";
     const MachineID   = body.MachineID ?? "";
     const ErrorCode   = body.ErrorCode ?? "";
     const ErrorText   = body.ErrorText ?? "";
 
-    // You can pass these from HMI; for now allow defaults
     const deviceId = body.deviceId ?? "HMI-UNKNOWN";
-    const scope    = body.scope ?? "submit"; // or "read"
+    const scope    = body.scope ?? "submit";
     const kid      = String(body.kid ?? "1");
 
-    // Time window (60 seconds example)
     const iat = nowUnix();
     const exp = iat + 60;
-
-    // Nonce for replay protection later
     const nonce = randomNonceHex(16);
 
-    // Build payload to sign
     const payload = {
       MachineName,
       MachineID,
@@ -104,11 +109,9 @@ app.post("/issue-link", (req, res) => {
       kid
     };
 
-    // Sign
     const canonical = buildCanonicalStringV2(payload);
     const sig = hmacSha256Hex(HMAC_SECRET_KEY, canonical);
 
-    // Build signed URL
     const baseUrl =
       process.env.FRONTEND_BASE_URL ||
       "https://ahmadiezat11246.github.io/QR/ContactPage.html";
@@ -127,16 +130,16 @@ app.post("/issue-link", (req, res) => {
       "&kid=" + enc(kid) +
       "&sig=" + enc(sig);
 
-    return res.status(200).json({
-      ok: true,
-      signedUrl,
-      payload // useful for debugging; you can remove later
-    });
+    return res.status(200).json({ ok: true, signedUrl, payload });
 
   } catch (err) {
     return res.status(500).json({ message: "Server error", error: err.message });
   }
 });
+
+
+// Optional: in-memory replay cache (prototype). Add later if you want replay protection.
+// const seenNonces = new Map(); // key: deviceId|nonce -> expUnix
 
 app.post("/log", (req, res) => {
   try {
@@ -144,17 +147,54 @@ app.post("/log", (req, res) => {
       return res.status(500).json({ message: "Server misconfigured: missing HMAC_SECRET_KEY" });
     }
 
-    const data = req.body;
+    const data = req.body || {};
+    const machinePart = data.machine ? data.machine : data;
 
-    // Signature from header, not from JSON
-    const receivedSig = (req.get("X-BMS-Signature") || "").toLowerCase();
+    // Accept signature from body (sig) or legacy header
+    const receivedSig =
+      ((machinePart.sig || data.sig || req.get("X-BMS-Signature")) || "").toLowerCase();
+
     if (!receivedSig) {
-      return res.status(400).json({ message: "Missing signature header" });
+      return res.status(400).json({ message: "Missing signature (sig in body or X-BMS-Signature header)" });
     }
 
-    // Build canonical string from machine object (if present) otherwise from body
-    const machinePart = data.machine ? data.machine : data;
-    const canonical = buildCanonicalString(machinePart);
+    // Require the V2 fields
+    const required = ["MachineName","MachineID","ErrorCode","ErrorText","iat","exp","nonce","scope","deviceId","kid"];
+    for (const k of required) {
+      const val = machinePart[k];
+      if (val === undefined || val === null || String(val).length === 0) {
+        return res.status(400).json({ message: `Missing required field: ${k}` });
+      }
+    }
+
+    // Enforce expiry
+    const now = nowUnix();
+    const exp = Number(machinePart.exp);
+    if (!Number.isFinite(exp)) {
+      return res.status(400).json({ message: "Invalid exp (must be unix seconds)" });
+    }
+    if (now > exp) {
+      return res.status(401).json({ message: "Token expired" });
+    }
+
+    // Enforce scope policy (this endpoint is submission)
+    if (String(machinePart.scope) !== "submit") {
+      return res.status(403).json({ message: "Scope not allowed for /log" });
+    }
+
+    // Verify signature over canonical V2
+    const canonical = buildCanonicalStringV2({
+      MachineName: String(machinePart.MachineName),
+      MachineID: String(machinePart.MachineID),
+      ErrorCode: String(machinePart.ErrorCode),
+      ErrorText: String(machinePart.ErrorText),
+      iat: String(machinePart.iat),
+      exp: String(machinePart.exp),
+      nonce: String(machinePart.nonce),
+      scope: String(machinePart.scope),
+      deviceId: String(machinePart.deviceId),
+      kid: String(machinePart.kid)
+    });
 
     const expectedSig = hmacSha256Hex(HMAC_SECRET_KEY, canonical);
 
@@ -162,16 +202,17 @@ app.post("/log", (req, res) => {
       return res.status(401).json({ message: "Invalid signature (tampered or wrong secret)" });
     }
 
+    // If you want replay protection later, check/store nonce here.
+
     const timestamp = new Date().toISOString();
     const logEntry = { ...data, timestamp, verified: true };
 
     fs.appendFileSync("machine_logs.json", JSON.stringify(logEntry) + "\n");
 
-    console.log("✅ Verified & logged data:", logEntry);
-    res.status(200).json({ message: "Data logged successfully", verified: true });
+    return res.status(200).json({ message: "Data logged successfully", verified: true });
 
   } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
+    return res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
