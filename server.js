@@ -27,7 +27,7 @@ function enc(v) {
 
 /**
  * V2 canonical string MUST match the HMI exactly:
- * MachineName, MachineID, ErrorCode, ErrorText, iat, exp, nonce, scope, deviceId, kid
+ * MachineName, MachineID, ErrorCode, ErrorText, iat, exp, nonce, deviceId, kid
  * (same order, URL-encoding)
  */
 function buildCanonicalStringV2(p) {
@@ -39,7 +39,6 @@ function buildCanonicalStringV2(p) {
     "&iat=" + enc(p.iat) +
     "&exp=" + enc(p.exp) +
     "&nonce=" + enc(p.nonce) +
-    "&scope=" + enc(p.scope) +
     "&deviceId=" + enc(p.deviceId) +
     "&kid=" + enc(p.kid)
   );
@@ -89,7 +88,6 @@ app.post("/issue-link", (req, res) => {
     const ErrorText   = body.ErrorText ?? "";
 
     const deviceId = body.deviceId ?? "HMI-UNKNOWN";
-    const scope    = body.scope ?? "submit";
     const kid      = String(body.kid ?? "1");
 
     const iat = nowUnix();
@@ -104,7 +102,6 @@ app.post("/issue-link", (req, res) => {
       iat: String(iat),
       exp: String(exp),
       nonce,
-      scope,
       deviceId,
       kid
     };
@@ -125,7 +122,6 @@ app.post("/issue-link", (req, res) => {
       "&iat=" + enc(iat) +
       "&exp=" + enc(exp) +
       "&nonce=" + enc(nonce) +
-      "&scope=" + enc(scope) +
       "&deviceId=" + enc(deviceId) +
       "&kid=" + enc(kid) +
       "&sig=" + enc(sig);
@@ -158,8 +154,8 @@ app.post("/log", (req, res) => {
       return res.status(400).json({ message: "Missing signature (sig in body or X-BMS-Signature header)" });
     }
 
-    // Require the V2 fields
-    const required = ["MachineName","MachineID","ErrorCode","ErrorText","iat","exp","nonce","scope","deviceId","kid"];
+    // Require the V2 fields (scope removed)
+    const required = ["MachineName","MachineID","ErrorCode","ErrorText","iat","exp","nonce","deviceId","kid"];
     for (const k of required) {
       const val = machinePart[k];
       if (val === undefined || val === null || String(val).length === 0) {
@@ -177,12 +173,7 @@ app.post("/log", (req, res) => {
       return res.status(401).json({ message: "Token expired" });
     }
 
-    // Enforce scope policy (this endpoint is submission)
-    if (String(machinePart.scope) !== "submit") {
-      return res.status(403).json({ message: "Scope not allowed for /log" });
-    }
-
-    // Verify signature over canonical V2
+    // Verify signature over canonical V2 (scope removed)
     const canonical = buildCanonicalStringV2({
       MachineName: String(machinePart.MachineName),
       MachineID: String(machinePart.MachineID),
@@ -191,7 +182,6 @@ app.post("/log", (req, res) => {
       iat: String(machinePart.iat),
       exp: String(machinePart.exp),
       nonce: String(machinePart.nonce),
-      scope: String(machinePart.scope),
       deviceId: String(machinePart.deviceId),
       kid: String(machinePart.kid)
     });
