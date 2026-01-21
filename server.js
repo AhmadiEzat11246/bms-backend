@@ -25,12 +25,19 @@ function enc(v) {
   return encodeURIComponent(v ?? "");
 }
 
+function nowUnix() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function randomNonceHex(bytes = 16) {
+  return crypto.randomBytes(bytes).toString("hex");
+}
+
 /**
- * V2 canonical string MUST match the HMI exactly:
- * MachineName, MachineID, ErrorCode, ErrorText, iat, exp, nonce, deviceId, kid
- * (same order, URL-encoding)
+ * Canonical string MUST match the HMI exactly (order + URL-encoding):
+ * MachineName, MachineID, ErrorCode, ErrorText, iat, exp, nonce, deviceId
  */
-function buildCanonicalStringV2(p) {
+function buildCanonicalString(p) {
   return (
     "MachineName=" + enc(p.MachineName) +
     "&MachineID=" + enc(p.MachineID) +
@@ -39,8 +46,7 @@ function buildCanonicalStringV2(p) {
     "&iat=" + enc(p.iat) +
     "&exp=" + enc(p.exp) +
     "&nonce=" + enc(p.nonce) +
-    "&deviceId=" + enc(p.deviceId) +
-    "&kid=" + enc(p.kid)
+    "&deviceId=" + enc(p.deviceId)
   );
 }
 
@@ -62,17 +68,24 @@ function safeCompareHex(a, b) {
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
-function nowUnix() {
-  return Math.floor(Date.now() / 1000);
-}
+/* =========================
+   Nonce replay protection
+   ========================= */
 
-function randomNonceHex(bytes = 16) {
-  return crypto.randomBytes(bytes).toString("hex");
-}
+// Replay cache: key = deviceId|nonce, value = expUnix
+const seenNonces = new Map();
+
+// Cleanup old entries periodically
+setInterval(() => {
+  const now = nowUnix();
+  for (const [k, exp] of seenNonces.entries()) {
+    if (exp <= now) seenNonces.delete(k);
+  }
+}, 60 * 1000); // every 60 seconds
 
 /**
- * Server-side issuing endpoint (optional in your offline-HMI scenario).
- * You can keep it for testing/demo, but your real flow is HMI-side signing.
+ * Server-side issuing endpoint (optional in offline-HMI scenario).
+ * Useful for testing/demo.
  */
 app.post("/issue-link", (req, res) => {
   try {
@@ -88,10 +101,9 @@ app.post("/issue-link", (req, res) => {
     const ErrorText   = body.ErrorText ?? "";
 
     const deviceId = body.deviceId ?? "HMI-UNKNOWN";
-    const kid      = String(body.kid ?? "1");
 
     const iat = nowUnix();
-    const exp = iat + 60;
+    const exp = iat + 60; // demo window
     const nonce = randomNonceHex(16);
 
     const payload = {
@@ -102,11 +114,10 @@ app.post("/issue-link", (req, res) => {
       iat: String(iat),
       exp: String(exp),
       nonce,
-      deviceId,
-      kid
+      deviceId
     };
 
-    const canonical = buildCanonicalStringV2(payload);
+    const canonical = buildCanonicalString(payload);
     const sig = hmacSha256Hex(HMAC_SECRET_KEY, canonical);
 
     const baseUrl =
@@ -123,7 +134,6 @@ app.post("/issue-link", (req, res) => {
       "&exp=" + enc(exp) +
       "&nonce=" + enc(nonce) +
       "&deviceId=" + enc(deviceId) +
-      "&kid=" + enc(kid) +
       "&sig=" + enc(sig);
 
     return res.status(200).json({ ok: true, signedUrl, payload });
@@ -132,10 +142,6 @@ app.post("/issue-link", (req, res) => {
     return res.status(500).json({ message: "Server error", error: err.message });
   }
 });
-
-
-// Optional: in-memory replay cache (prototype). Add later if you want replay protection.
-// const seenNonces = new Map(); // key: deviceId|nonce -> expUnix
 
 app.post("/log", (req, res) => {
   try {
@@ -154,8 +160,8 @@ app.post("/log", (req, res) => {
       return res.status(400).json({ message: "Missing signature (sig in body or X-BMS-Signature header)" });
     }
 
-    // Require the V2 fields (scope removed)
-    const required = ["MachineName","MachineID","ErrorCode","ErrorText","iat","exp","nonce","deviceId","kid"];
+    // Require fields (scope/kid removed)
+    const required = ["MachineName","MachineID","ErrorCode","ErrorText","iat","exp","nonce","deviceId"];
     for (const k of required) {
       const val = machinePart[k];
       if (val === undefined || val === null || String(val).length === 0) {
@@ -173,17 +179,16 @@ app.post("/log", (req, res) => {
       return res.status(401).json({ message: "Token expired" });
     }
 
-    // Verify signature over canonical V2 (scope removed)
-    const canonical = buildCanonicalStringV2({
+    // Verify signature over canonical string (scope/kid removed)
+    const canonical = buildCanonicalString({
       MachineName: String(machinePart.MachineName),
-      MachineID: String(machinePart.MachineID),
-      ErrorCode: String(machinePart.ErrorCode),
-      ErrorText: String(machinePart.ErrorText),
-      iat: String(machinePart.iat),
-      exp: String(machinePart.exp),
-      nonce: String(machinePart.nonce),
-      deviceId: String(machinePart.deviceId),
-      kid: String(machinePart.kid)
+      MachineID:   String(machinePart.MachineID),
+      ErrorCode:   String(machinePart.ErrorCode),
+      ErrorText:   String(machinePart.ErrorText),
+      iat:         String(machinePart.iat),
+      exp:         String(machinePart.exp),
+      nonce:       String(machinePart.nonce),
+      deviceId:    String(machinePart.deviceId)
     });
 
     const expectedSig = hmacSha256Hex(HMAC_SECRET_KEY, canonical);
@@ -192,7 +197,16 @@ app.post("/log", (req, res) => {
       return res.status(401).json({ message: "Invalid signature (tampered or wrong secret)" });
     }
 
-    // If you want replay protection later, check/store nonce here.
+    // ===== Replay protection (nonce enforcement) =====
+    // Use deviceId+nonce so different devices can reuse same nonce value safely.
+    const nonceKey = String(machinePart.deviceId) + "|" + String(machinePart.nonce);
+
+    if (seenNonces.has(nonceKey)) {
+      return res.status(409).json({ message: "Replay detected (nonce already used)" });
+    }
+
+    // Store until expiration to keep memory bounded
+    seenNonces.set(nonceKey, exp);
 
     const timestamp = new Date().toISOString();
     const logEntry = { ...data, timestamp, verified: true };
